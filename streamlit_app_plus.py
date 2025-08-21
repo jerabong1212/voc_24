@@ -1,52 +1,79 @@
+import io
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 
-# ---------- Lazy stats import (only when needed) ----------
-def _lazy_import_stats():
-    import importlib
-    sm = importlib.import_module("statsmodels.api")
-    smf = importlib.import_module("statsmodels.formula.api")
+# ============================
+# Setup
+# ============================
+st.set_page_config(page_title="VOC & 환경 데이터 시각화", layout="wide")
+st.title("🌿 식물 VOC & 환경 데이터 시각화")
+
+def sem_from_sd(sd, n):
     try:
-        mc_mod = importlib.import_module("statsmodels.stats.multicomp")
-        MultiComparison = getattr(mc_mod, "MultiComparison")
+        return sd / np.sqrt(n) if (sd is not None and n and n > 0) else np.nan
     except Exception:
-        MultiComparison = None
-    try:
-        sp = importlib.import_module("scikit_posthocs")
-        HAS_SCPH = True
-    except Exception:
-        sp = None
-        HAS_SCPH = False
-    return sm, smf, MultiComparison, sp, HAS_SCPH
+        return np.nan
 
-st.set_page_config(page_title="VOC 실험 시각화", layout="wide")
-st.title("🌿 식물 VOC 실험 결과 시각화")
+def safe_line(df, x, y, **kwargs):
+    """Robust px.line with optional error_y support."""
+    if df is None or df.empty or x not in df.columns or y not in df.columns:
+        st.info(f"그래프 대상 데이터가 없습니다: {y}")
+        return
+    d = df.copy()
+    d[x] = pd.to_datetime(d[x], errors="coerce")
+    d[y] = pd.to_numeric(d[y], errors="coerce")
+    err_col = kwargs.pop("error_y", None)
+    if err_col is not None and isinstance(err_col, str) and err_col in d.columns:
+        d[err_col] = pd.to_numeric(d[err_col], errors="coerce")
+        d = d.dropna(subset=[x, y, err_col])
+        fig = px.line(d, x=x, y=y, error_y=err_col, markers=True, **kwargs)
+    else:
+        d = d.dropna(subset=[x, y])
+        fig = px.line(d, x=x, y=y, markers=True, **kwargs)
+    fig.update_layout(margin=dict(l=10,r=10,t=50,b=10))
+    st.plotly_chart(fig, use_container_width=True)
 
-# =========================================================
-# 1) 업로드 + 시트 선택/병합 + 템플릿 다운로드 + 컬럼 자동 매핑
-# =========================================================
-st.sidebar.header("📁 데이터 불러오기")
+def safe_bar(df, x, y, **kwargs):
+    """Robust px.bar with optional error_y support."""
+    if df is None or df.empty or x not in df.columns or y not in df.columns:
+        st.info("막대그래프 대상 데이터가 없습니다.")
+        return
+    d = df.copy()
+    d[y] = pd.to_numeric(d[y], errors="coerce")
+    err_col = kwargs.pop("error_y", None)
+    if err_col is not None and isinstance(err_col, str) and err_col in d.columns:
+        d[err_col] = pd.to_numeric(d[err_col], errors="coerce")
+        d = d.dropna(subset=[y, err_col])
+        fig = px.bar(d, x=x, y=y, error_y=err_col, **kwargs)
+    else:
+        d = d.dropna(subset=[y])
+        fig = px.bar(d, x=x, y=y, **kwargs)
+    fig.update_layout(margin=dict(l=10,r=10,t=50,b=10))
+    st.plotly_chart(fig, use_container_width=True)
 
+# ============================
+# 1) VOC 데이터 업로드/매핑
+# ============================
+st.sidebar.header("📁 VOC 데이터 불러오기")
 @st.cache_data(show_spinner=False)
-def _read_any(file, name):
+def _read_any(file_bytes, name):
     ext = str(name).lower().split(".")[-1]
     if ext == "csv":
-        df = pd.read_csv(file)
-        return df, None  # no sheets
-    xlf = pd.ExcelFile(file)
-    return None, xlf.sheet_names  # defer parsing per sheet
+        return pd.read_csv(io.BytesIO(file_bytes)), None
+    xlf = pd.ExcelFile(io.BytesIO(file_bytes))
+    return None, xlf.sheet_names
 
 @st.cache_data(show_spinner=False)
-def _read_excel_sheet(file, sheet_name):
-    xlf = pd.ExcelFile(file)
+def _read_excel_sheet(file_bytes, sheet_name):
+    xlf = pd.ExcelFile(io.BytesIO(file_bytes))
     return xlf.parse(sheet_name)
 
 @st.cache_data(show_spinner=False)
-def _read_excel_all(file, sheet_names):
+def _read_excel_all(file_bytes, sheet_names):
     frames = []
-    xlf = pd.ExcelFile(file)
+    xlf = pd.ExcelFile(io.BytesIO(file_bytes))
     for s in sheet_names:
         try:
             df = xlf.parse(s)
@@ -69,27 +96,28 @@ def _template_bytes():
     pd.DataFrame(columns=template_cols).to_excel(buf, index=False, engine="openpyxl")
     return buf.getvalue()
 
-# 템플릿 다운로드
 st.sidebar.download_button(
-    "⬇️ 템플릿 엑셀 다운로드",
+    "⬇️ VOC 템플릿 엑셀",
     data=_template_bytes(),
     file_name="VOC_template.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
-uploaded = st.sidebar.file_uploader("VOC 데이터 업로드 (xlsx/xls/csv)", type=["xlsx","xls","csv"])
-use_demo = st.sidebar.button("🧪 데모 데이터 불러오기")
+uploaded_voc = st.sidebar.file_uploader("VOC 데이터 업로드 (xlsx/xls/csv)", type=["xlsx","xls","csv"], key="voc_file")
+use_demo_voc = st.sidebar.button("🧪 VOC 데모 데이터")
 
-df, file_name = None, None
-sheet_names = None
+voc_df, voc_file_name = None, None
+voc_sheet_names = None
+voc_file_bytes = None
 
-if uploaded is not None:
-    tmp, sheet_names = _read_any(uploaded, uploaded.name)
+if uploaded_voc is not None:
+    voc_file_bytes = uploaded_voc.getvalue()
+    tmp, voc_sheet_names = _read_any(voc_file_bytes, uploaded_voc.name)
     if tmp is not None:  # CSV
-        df = tmp
-    file_name = uploaded.name
+        voc_df = tmp
+    voc_file_name = uploaded_voc.name
 
-if use_demo and df is None and uploaded is None:
+if use_demo_voc and voc_df is None and uploaded_voc is None:
     demo = {
         "Name": ["A"]*18,
         "Treatment": ["control"]*6 + ["herbivory"]*6 + ["threat"]*6,
@@ -105,28 +133,20 @@ if use_demo and df is None and uploaded is None:
         "Sub-repetition": [1,2,3]*6,
         "linalool": np.r_[np.random.normal(5,0.3,6), np.random.normal(7,0.3,6), np.random.normal(9,0.3,6)],
     }
-    df = pd.DataFrame(demo)
-    file_name = "DEMO"
+    voc_df = pd.DataFrame(demo)
+    voc_file_name = "DEMO"
 
-# 엑셀 다중 시트 지원
-if df is None and sheet_names is not None:
-    st.sidebar.markdown("**엑셀 시트 구성 감지됨**")
-    combine_all = st.sidebar.checkbox("📑 모든 시트 합쳐서 분석", value=False)
+if voc_df is None and voc_sheet_names is not None and voc_file_bytes is not None:
+    st.sidebar.markdown("**엑셀 시트 구성 감지됨 (VOC)**")
+    combine_all = st.sidebar.checkbox("📑 모든 시트 합쳐서 분석", value=False, key="voc_merge_all")
     if combine_all:
-        df = _read_excel_all(uploaded, sheet_names)
+        voc_df = _read_excel_all(voc_file_bytes, voc_sheet_names)
         st.sidebar.caption("모든 시트를 세로 병합했습니다.")
     else:
-        sel_sheet = st.sidebar.selectbox("📑 시트 선택", sheet_names, index=0)
-        df = _read_excel_sheet(uploaded, sel_sheet)
+        sel_sheet = st.sidebar.selectbox("📑 시트 선택", voc_sheet_names, index=0, key="voc_sheet_sel")
+        voc_df = _read_excel_sheet(voc_file_bytes, sel_sheet)
 
-# 파일명/정보 배지
-if df is None:
-    st.info("왼쪽 사이드바에서 파일을 업로드하거나 **🧪 데모 데이터**로 시작하세요.")
-    st.stop()
-else:
-    st.caption(f"🗂️ 데이터 소스: **{file_name}** | 행: {len(df)}")
-
-# ---------- 표준 컬럼 이름으로 자동 매핑 ----------
+# VOC 컬럼 매핑
 CANON = {
     "Name": ["name","sample","시료","샘플","이름"],
     "Treatment": ["treatment","처리","처리구","group","그룹"],
@@ -143,27 +163,22 @@ CANON = {
 }
 def _normalize(s):
     return str(s).strip().lower().replace("_"," ").replace("-"," ")
-
 def standardize_columns(df):
+    if df is None: return df
     col_map = {}
     for c in df.columns:
         lc = _normalize(c)
         mapped = None
         for canon, aliases in CANON.items():
             if lc == _normalize(canon) or lc in [_normalize(a) for a in aliases]:
-                mapped = canon
-                break
-        if mapped:
-            col_map[c] = mapped
-    if col_map:
-        df = df.rename(columns=col_map)
+                mapped = canon; break
+        if mapped: col_map[c] = mapped
+    if col_map: df = df.rename(columns=col_map)
     return df
+if voc_df is not None:
+    voc_df = standardize_columns(voc_df)
 
-df = standardize_columns(df)
-
-# =========================================================
-# 2) 애널리틱스 준비: VOC 컬럼 탐지 + 공통 상수
-# =========================================================
+# VOC constants
 NAME_COL      = "Name"
 TREAT_COL     = "Treatment"
 START_COL     = "Start Date"
@@ -174,12 +189,10 @@ PROGRESS_COL  = "Progress"
 INTERVAL_COL  = "Interval (h)"
 TEMP_COL      = "Temp (℃)"
 HUMID_COL     = "Humid (%)"
-
-# 반복/소반복 자동 감지 (여러 표기 허용)
 REP_CANDIDATES    = ["Repetition", "rep", "Rep", "repetition", "반복", "반복수"]
 SUBREP_CANDIDATES = ["Sub-repetition", "subrep", "Subrep", "Sub-rep", "sub-repetition", "소반복", "소반복수"]
-REP_COL    = next((c for c in REP_CANDIDATES if c in df.columns), None)
-SUBREP_COL = next((c for c in SUBREP_CANDIDATES if c in df.columns), None)
+REP_COL    = next((c for c in REP_CANDIDATES if (voc_df is not None and c in voc_df.columns)), None)
+SUBREP_COL = next((c for c in SUBREP_CANDIDATES if (voc_df is not None and c in voc_df.columns)), None)
 
 VOC_24_CANDIDATES = [
     "(+/-)-trans-nerolidol",
@@ -207,82 +220,33 @@ VOC_24_CANDIDATES = [
     "toluene",
     "xylenes + ethylbenzene",
 ]
-DISPLAY_MAP = {
-    "DEN": "DMNT",
-    "DMNT": "DMNT",
-    "methyl jasmonate (20180404ATFtest)": "Methyl jasmonate",
-    "methyl jasmonate (temporary)": "Methyl jasmonate",
-}
+DISPLAY_MAP = {"DEN":"DMNT","DMNT":"DMNT","methyl jasmonate (20180404ATFtest)":"Methyl jasmonate","methyl jasmonate (temporary)":"Methyl jasmonate"}
 def display_name(col):
     return DISPLAY_MAP.get(col, col)
 
 def resolve_voc_columns(df, candidates):
+    if df is None: return []
     resolved = []
     for col in candidates:
-        if col in df.columns:
-            resolved.append(col)
-        elif col == "DEN" and "DMNT" in df.columns:
-            resolved.append("DMNT")
-    # fallback: any numeric columns not recognized as meta
+        if col in df.columns: resolved.append(col)
+        elif col == "DEN" and "DMNT" in df.columns: resolved.append("DMNT")
     meta_cols = set([NAME_COL,TREAT_COL,START_COL,END_COL,CHAMBER_COL,LINE_COL,PROGRESS_COL,INTERVAL_COL,TEMP_COL,HUMID_COL,REP_COL,SUBREP_COL])
-    numeric_candidates = [c for c in df.columns if c not in meta_cols and pd.api.types.is_numeric_dtype(df[c])]
-    if not resolved and numeric_candidates:
-        resolved = numeric_candidates
+    numeric_candidates = [c for c in (df.columns if df is not None else []) if c not in meta_cols and pd.api.types.is_numeric_dtype(df[c])]
+    if not resolved and numeric_candidates: resolved = numeric_candidates
     return resolved
+voc_columns = resolve_voc_columns(voc_df, VOC_24_CANDIDATES) if voc_df is not None else []
+if voc_df is not None and INTERVAL_COL in voc_df.columns:
+    voc_df[INTERVAL_COL] = pd.to_numeric(voc_df[INTERVAL_COL], errors="coerce")
 
-voc_columns = resolve_voc_columns(df, VOC_24_CANDIDATES)
-if not voc_columns:
-    st.error("VOC 수치형 컬럼을 찾지 못했습니다. 데이터 헤더를 확인하세요.")
-    st.stop()
-elif set(voc_columns) != set(VOC_24_CANDIDATES):
-    st.info(
-        (
-            "데이터에서 감지된 VOC 컬럼: "
-            f"{', '.join([display_name(c) for c in voc_columns])}"
-        )
-    )
+# ============================
+# 2) 분석 모드 (4가지 항상 표시)
+# ============================
+mode = st.sidebar.radio("분석 모드 선택", ["처리별 VOC 비교", "시간별 VOC 변화", "전체 VOC 스크리닝", "환경 데이터 분석"])
 
-# Interval numeric coercion
-if INTERVAL_COL in df.columns:
-    df[INTERVAL_COL] = pd.to_numeric(df[INTERVAL_COL], errors="coerce")
-
-# =========================================================
-# 3) 사이드바 필터/옵션
-# =========================================================
-st.sidebar.header("🔧 분석 옵션")
-chambers = ["전체"] + sorted(df[CHAMBER_COL].dropna().astype(str).unique().tolist()) if CHAMBER_COL in df.columns else ["전체"]
-lines    = ["전체"] + sorted(df[LINE_COL].dropna().astype(str).unique().tolist()) if LINE_COL in df.columns else ["전체"]
-chamber_sel = st.sidebar.selectbox("🏠 Chamber", chambers, index=0)
-line_sel    = st.sidebar.selectbox("🧵 Line", lines, index=0)
-
-treatments = sorted(df[TREAT_COL].dropna().astype(str).unique().tolist()) if TREAT_COL in df.columns else []
-treatments_for_ts = ["전체"] + treatments
-intervals_all = sorted(df[INTERVAL_COL].dropna().unique().tolist()) if INTERVAL_COL in df.columns else []
-reps_all = ["전체"] + sorted(df[REP_COL].dropna().astype(str).unique().tolist()) if REP_COL else ["전체"]
-progress_vals_all = sorted(df[PROGRESS_COL].dropna().astype(str).unique().tolist()) if PROGRESS_COL in df.columns else []
-
-rep_sel = st.sidebar.selectbox("🔁 Repetition", reps_all, index=0) if REP_COL else "전체"
-progress_sel = st.sidebar.multiselect("🧭 Progress(복수 선택 가능)", progress_vals_all, default=progress_vals_all)
-
-mode = st.sidebar.radio("분석 모드 선택", ["처리별 VOC 비교", "시간별 VOC 변화", "전체 VOC 스크리닝"])
-
-if mode != "전체 VOC 스크리닝":
-    selected_voc = st.sidebar.selectbox("📌 VOC 물질 선택", [display_name(c) for c in voc_columns])
-    inv_map = {display_name(c): c for c in voc_columns}
-    selected_voc_internal = inv_map[selected_voc]
-else:
-    selected_voc = None
-    selected_voc_internal = None
-
-facet_by_chamber = st.sidebar.checkbox("Chamber로 분할 보기", value=False)
-facet_by_line    = st.sidebar.checkbox("Line으로 분할 보기", value=False)
-err_mode = st.sidebar.radio("오차 기준", ["SD", "SEM"], index=0)
-show_subrep_lines = st.sidebar.checkbox("소반복 라인 표시", value=bool(SUBREP_COL)) if SUBREP_COL else False
-
-# =========================================================
-# 4) 필터 적용 + 유틸
-# =========================================================
-def apply_filters(df):
+# ============================
+# 3) VOC 모드
+# ============================
+def apply_filters(df, chamber_sel, line_sel, progress_sel, rep_sel):
     out = df.copy()
     if CHAMBER_COL in out.columns and chamber_sel != "전체":
         out = out[out[CHAMBER_COL].astype(str) == str(chamber_sel)]
@@ -294,9 +258,7 @@ def apply_filters(df):
         out = out[out[REP_COL].astype(str) == str(rep_sel)]
     return out
 
-filtered_df = apply_filters(df)
-
-def add_facets(kwargs, data_frame):
+def add_facets(kwargs, data_frame, facet_by_chamber, facet_by_line):
     if facet_by_chamber and CHAMBER_COL in data_frame.columns:
         kwargs["facet_col"] = CHAMBER_COL
     if facet_by_line and LINE_COL in data_frame.columns:
@@ -306,423 +268,481 @@ def add_facets(kwargs, data_frame):
             kwargs["facet_col"] = LINE_COL
     return kwargs
 
-def p_to_stars(p):
-    if p < 0.001:
-        return "***"
-    elif p < 0.01:
-        return "**"
-    elif p < 0.05:
-        return "*"
+if mode in ["처리별 VOC 비교", "시간별 VOC 변화", "전체 VOC 스크리닝"]:
+    if voc_df is None or not len(voc_columns):
+        st.info("VOC 데이터 업로드 후 이용해주세요.")
     else:
-        return "ns"
+        # 공통 필터
+        chambers = ["전체"] + sorted(voc_df[CHAMBER_COL].dropna().astype(str).unique().tolist()) if CHAMBER_COL in voc_df.columns else ["전체"]
+        lines    = ["전체"] + sorted(voc_df[LINE_COL].dropna().astype(str).unique().tolist()) if LINE_COL in voc_df.columns else ["전체"]
+        chamber_sel = st.sidebar.selectbox("🏠 Chamber", chambers, index=0)
+        line_sel    = st.sidebar.selectbox("🧵 Line", lines, index=0)
+        intervals_all = sorted(voc_df[INTERVAL_COL].dropna().unique().tolist()) if INTERVAL_COL in voc_df.columns else []
+        reps_all = ["전체"] + sorted(voc_df[REP_COL].dropna().astype(str).unique().tolist()) if REP_COL else ["전체"]
+        progress_vals_all = sorted(voc_df[PROGRESS_COL].dropna().astype(str).unique().tolist()) if PROGRESS_COL in voc_df.columns else []
+        rep_sel = st.sidebar.selectbox("🔁 Repetition", reps_all, index=0) if REP_COL else "전체"
+        progress_sel = st.sidebar.multiselect("🧭 Progress(복수 선택 가능)", progress_vals_all, default=progress_vals_all)
+        facet_by_chamber = st.sidebar.checkbox("Chamber로 분할 보기", value=False)
+        facet_by_line    = st.sidebar.checkbox("Line으로 분할 보기", value=False)
+        err_mode = st.sidebar.radio("오차 기준", ["SD", "SEM"], index=0)
 
-def cld_from_nonsig(groups, pairs_ns):
-    groups = list(groups)
-    letters = {g: "" for g in groups}
-    remaining = set(groups)
-    alphabet = list("abcdefghijklmnopqrstuvwxyz")
-    li = 0
-    while remaining:
-        letter = alphabet[li % len(alphabet)]
-        bucket = []
-        for g in list(remaining):
-            ok = True
-            for h in bucket:
-                pair = tuple(sorted((g, h)))
-                if pair not in pairs_ns and g != h:
-                    ok = False
-                    break
-            if ok:
-                bucket.append(g)
-        for g in bucket:
-            letters[g] += letter
-            remaining.remove(g)
-        li += 1
-    for g in groups:
-        if letters[g] == "":
-            letters[g] = "a"
-    return letters
-
-def sem_from_sd(sd, n):
-    try:
-        return sd / np.sqrt(n) if (sd is not None and n and n > 0) else np.nan
-    except Exception:
-        return np.nan
-
-def attach_error_col(df_stats, err_mode):
-    df_stats = df_stats.copy()
-    if "sd" not in df_stats.columns:
-        df_stats["sd"] = np.nan
-    if "n" not in df_stats.columns:
-        df_stats["n"] = np.nan
-    if err_mode == "SEM":
-        df_stats["err"] = df_stats.apply(lambda r: sem_from_sd(r.get("sd", np.nan), r.get("n", np.nan)), axis=1)
-    else:
-        df_stats["err"] = df_stats.get("sd", np.nan)
-    return df_stats
-
-# =========================================================
-# 5) 분석 모드
-# =========================================================
-if mode in ["처리별 VOC 비교", "시간별 VOC 변화"]:
-    if mode == "처리별 VOC 비교":
-        chart_type = st.sidebar.radio("차트 유형", ["막대그래프", "박스플롯"], index=0)
-        selected_interval = st.sidebar.selectbox("⏱ Interval (h) 선택", ["전체"] + intervals_all)
-
-        # Stats options
-        show_anova = False
-        posthoc_choices = []
-        alpha = 0.05
-        letters_method_for_plot = None
-        include_rep_block = False
-
-        if chart_type == "막대그래프":
-            show_anova = st.sidebar.checkbox("ANOVA 분석 표시(막대그래프 전용)", value=False)
-            include_rep_block = st.sidebar.checkbox("반복을 블록요인으로 포함", value=bool(REP_COL)) if REP_COL else False
-            if show_anova:
-                alpha = st.sidebar.number_input("유의수준 α", min_value=0.001, max_value=0.20, value=0.05, step=0.001, format="%.3f")
-                allowed_methods = ["Tukey HSD", "Duncan"]
-                posthoc_choices = st.sidebar.multiselect("사후검정 선택(복수 가능)", allowed_methods, default=["Tukey HSD"])
-                if len(posthoc_choices) > 0:
-                    letters_method_for_plot = st.sidebar.selectbox("그래프에 표시할 유의문자 기준", posthoc_choices, index=0)
-
-    else:  # 시간별 VOC 변화
-        selected_treatment = st.sidebar.selectbox("🧪 처리구 선택", ["전체"] + treatments)
-
-    # ----- 처리별 VOC 비교 -----
-    if mode == "처리별 VOC 비교":
-        if selected_interval == "전체":
-            data_use = filtered_df.copy()
-            title_suffix = "모든 시간"
+        if mode != "전체 VOC 스크리닝":
+            selected_voc = st.sidebar.selectbox("📌 VOC 물질 선택", [display_name(c) for c in voc_columns])
+            inv_map = {display_name(c): c for c in voc_columns}
+            selected_voc_internal = inv_map[selected_voc]
         else:
-            data_use = filtered_df[filtered_df[INTERVAL_COL] == selected_interval].copy()
-            title_suffix = f"Interval: {selected_interval}h"
+            selected_voc, selected_voc_internal = None, None
 
-        y_label = f"{selected_voc} 농도 (ppb)"
-        color_kw = {"color": PROGRESS_COL} if (PROGRESS_COL in data_use.columns and data_use[PROGRESS_COL].notna().any()) else {}
+        filtered_df = apply_filters(voc_df, chamber_sel, line_sel, progress_sel, rep_sel)
 
-        if chart_type == "막대그래프":
-            group_keys = [TREAT_COL]
-            if PROGRESS_COL in data_use.columns:
-                group_keys.append(PROGRESS_COL)
-            if CHAMBER_COL in data_use.columns and facet_by_chamber:
-                group_keys.append(CHAMBER_COL)
-            if LINE_COL in data_use.columns and facet_by_line:
-                group_keys.append(LINE_COL)
+        if mode == "처리별 VOC 비교":
+            chart_type = st.sidebar.radio("차트 유형", ["막대그래프", "박스플롯"], index=0)
+            selected_interval = st.sidebar.selectbox("⏱ Interval (h) 선택", ["전체"] + intervals_all)
 
-            # sub-rep -> rep -> treatment summary
-            if SUBREP_COL and SUBREP_COL in data_use.columns:
-                per_subrep = (
-                    data_use.groupby(group_keys + ([REP_COL] if REP_COL else []) + [SUBREP_COL])[selected_voc_internal]
-                    .mean()
-                    .reset_index()
-                )
+            if selected_interval == "전체":
+                data_use = filtered_df.copy()
+                title_suffix = "모든 시간"
             else:
-                per_subrep = data_use.copy()
+                data_use = filtered_df[filtered_df[INTERVAL_COL] == selected_interval].copy()
+                title_suffix = f"Interval: {selected_interval}h"
 
-            if REP_COL and REP_COL in data_use.columns:
-                per_rep = per_subrep.groupby(group_keys + [REP_COL])[selected_voc_internal].mean().reset_index()
-                grouped = per_rep.groupby(group_keys)[selected_voc_internal].agg(mean="mean", sd="std", n="count").reset_index()
-            else:
-                grouped = per_subrep.groupby(group_keys)[selected_voc_internal].agg(mean="mean", sd="std", n="count").reset_index()
+            y_label = f"{selected_voc} 농도 (ppb)"
+            color_kw = {"color": PROGRESS_COL} if (PROGRESS_COL in data_use.columns and data_use[PROGRESS_COL].notna().any()) else {}
 
-            grouped = attach_error_col(grouped, err_mode)
+            if chart_type == "막대그래프":
+                group_keys = [TREAT_COL]
+                if PROGRESS_COL in data_use.columns: group_keys.append(PROGRESS_COL)
+                if CHAMBER_COL in data_use.columns and facet_by_chamber: group_keys.append(CHAMBER_COL)
+                if LINE_COL in data_use.columns and facet_by_line: group_keys.append(LINE_COL)
 
-            fig_kwargs = dict(
-                x=TREAT_COL, y="mean",
-                labels={"mean": y_label, TREAT_COL: "처리"},
-                title=f"{selected_voc} - 처리별 평균 비교 ({title_suffix})",
-                **color_kw
-            )
-            fig_kwargs = add_facets(fig_kwargs, grouped)
-            fig = px.bar(grouped, **fig_kwargs, error_y="err", barmode="group")
-            fig.update_layout(margin=dict(l=10, r=10, t=60, b=10))
-
-            if show_anova:
-                sm, smf, MultiComparison, sp, HAS_SCPH = _lazy_import_stats()
-                base_cols = [TREAT_COL, selected_voc_internal]
-                if REP_COL: base_cols.append(REP_COL)
-                anova_df = data_use[base_cols].dropna().copy()
-                if anova_df[TREAT_COL].nunique() >= 2 and all(anova_df.groupby(TREAT_COL)[selected_voc_internal].count() >= 2):
-                    a_df = anova_df.rename(columns={selected_voc_internal: "y", TREAT_COL: "treat"})
-                    try:
-                        if include_rep_block and REP_COL and REP_COL in a_df.columns:
-                            a_df["rep"] = a_df[REP_COL].astype(str)
-                            model = smf.ols("y ~ C(treat) + C(rep)", data=a_df).fit()
-                        else:
-                            model = smf.ols("y ~ C(treat)", data=a_df).fit()
-                    except Exception:
-                        model = smf.ols("y ~ C(treat)", data=a_df).fit()
-                    anova_table = sm.stats.anova_lm(model, typ=2)
-
-                    pval = float(anova_table.loc["C(treat)", "PR(>F)"]) if "C(treat)" in anova_table.index else float("nan")
-                    stars = p_to_stars(pval) if np.isfinite(pval) else "n/a"
-                    fig.update_layout(title=f"{selected_voc} - 처리별 평균 비교 ({title_suffix})  |  ANOVA: p={pval:.4g} ({stars})")
-
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.subheader("ANOVA 결과")
-                    st.dataframe(anova_table)
+                if SUBREP_COL and SUBREP_COL in data_use.columns:
+                    per_subrep = data_use.groupby(group_keys + ([REP_COL] if REP_COL else []) + [SUBREP_COL])[selected_voc_internal].mean().reset_index()
                 else:
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.info("ANOVA를 수행하기 위한 표본 수가 충분하지 않습니다. (처리 수준 ≥2, 각 처리 n≥2 권장)")
-            else:
+                    per_subrep = data_use.copy()
+
+                if REP_COL and REP_COL in data_use.columns:
+                    per_rep = per_subrep.groupby(group_keys + [REP_COL])[selected_voc_internal].mean().reset_index()
+                    grouped = per_rep.groupby(group_keys)[selected_voc_internal].agg(mean="mean", sd="std", n="count").reset_index()
+                else:
+                    grouped = per_subrep.groupby(group_keys)[selected_voc_internal].agg(mean="mean", sd="std", n="count").reset_index()
+
+                grouped["err"] = grouped.apply(lambda r: sem_from_sd(r["sd"], r["n"]) if err_mode=="SEM" else r["sd"], axis=1)
+
+                fig_kwargs = dict(x=TREAT_COL, y="mean", labels={"mean": y_label, TREAT_COL: "처리"}, title=f"{selected_voc} - 처리별 평균 비교 ({title_suffix})", **color_kw)
+                fig_kwargs = add_facets(fig_kwargs, grouped, facet_by_chamber, facet_by_line)
+                safe_bar(grouped, error_y="err", **fig_kwargs)
+
+            else:  # 박스플롯
+                use_rep_agg_box = st.sidebar.checkbox("박스플롯도 반복 평균 기반으로 요약", value=False) if REP_COL else False
+                if use_rep_agg_box and REP_COL:
+                    group_keys_box = [TREAT_COL]
+                    if PROGRESS_COL in data_use.columns: group_keys_box.append(PROGRESS_COL)
+                    if CHAMBER_COL in data_use.columns and facet_by_chamber: group_keys_box.append(CHAMBER_COL)
+                    if LINE_COL in data_use.columns and facet_by_line: group_keys_box.append(LINE_COL)
+                    if SUBREP_COL and SUBREP_COL in data_use.columns:
+                        per_subrep_box = data_use.groupby(group_keys_box + [REP_COL, SUBREP_COL])[selected_voc_internal].mean().reset_index()
+                    else:
+                        per_subrep_box = data_use.groupby(group_keys_box + [REP_COL])[selected_voc_internal].mean().reset_index()
+                    per_rep_box = per_subrep_box.groupby(group_keys_box + [REP_COL])[selected_voc_internal].mean().reset_index()
+                    data_for_box = per_rep_box
+                    y_for_box = selected_voc_internal
+                else:
+                    data_for_box = data_use
+                    y_for_box = selected_voc_internal
+                fig_kwargs = dict(x=TREAT_COL, y=y_for_box, labels={y_for_box: y_label, TREAT_COL: "처리"}, title=f"{selected_voc} - 처리별 분포 (박스플롯) ({title_suffix})", points="outliers", **color_kw)
+                fig_kwargs = add_facets(fig_kwargs, data_for_box, facet_by_chamber, facet_by_line)
+                fig = px.box(data_for_box, **fig_kwargs)
+                fig.update_layout(margin=dict(l=10, r=10, t=60, b=10))
                 st.plotly_chart(fig, use_container_width=True)
 
-        else:  # 박스플롯
-            use_rep_agg_box = st.sidebar.checkbox("박스플롯도 반복 평균 기반으로 요약", value=False) if REP_COL else False
-            if use_rep_agg_box and REP_COL:
-                group_keys_box = [TREAT_COL]
-                if PROGRESS_COL in data_use.columns:
-                    group_keys_box.append(PROGRESS_COL)
-                if CHAMBER_COL in data_use.columns and facet_by_chamber:
-                    group_keys_box.append(CHAMBER_COL)
-                if LINE_COL in data_use.columns and facet_by_line:
-                    group_keys_box.append(LINE_COL)
-                if SUBREP_COL and SUBREP_COL in data_use.columns:
-                    per_subrep_box = data_use.groupby(group_keys_box + [REP_COL, SUBREP_COL])[selected_voc_internal].mean().reset_index()
-                else:
-                    per_subrep_box = data_use.groupby(group_keys_box + [REP_COL])[selected_voc_internal].mean().reset_index()
-                per_rep_box = per_subrep_box.groupby(group_keys_box + [REP_COL])[selected_voc_internal].mean().reset_index()
-                data_for_box = per_rep_box
-                y_for_box = selected_voc_internal
-            else:
-                data_for_box = data_use
-                y_for_box = selected_voc_internal
-            fig_kwargs = dict(
-                x=TREAT_COL, y=y_for_box,
-                labels={y_for_box: y_label, TREAT_COL: "처리"},
-                title=f"{selected_voc} - 처리별 분포 (박스플롯) ({title_suffix})",
-                points="outliers",
-                **color_kw,
-            )
-            fig_kwargs = add_facets(fig_kwargs, data_for_box)
-            fig = px.box(data_for_box, **fig_kwargs)
-            fig.update_layout(margin=dict(l=10, r=10, t=60, b=10))
-            st.plotly_chart(fig, use_container_width=True)
+        elif mode == "시간별 VOC 변화":
+            treatments = sorted(voc_df[TREAT_COL].dropna().astype(str).unique().tolist()) if TREAT_COL in voc_df.columns else []
+            selected_treatment = st.sidebar.selectbox("🧪 처리구 선택", ["전체"] + treatments)
 
-    # ----- 시간별 VOC 변화 -----
-    else:
-        if selected_treatment == "전체":
-            data_use = filtered_df.copy()
-            title_prefix = "모든 처리"
-        else:
-            data_use = filtered_df[filtered_df[TREAT_COL].astype(str) == str(selected_treatment)].copy()
-            title_prefix = f"{selected_treatment} 처리"
-
-        tick_vals = sorted(df[INTERVAL_COL].dropna().unique().tolist()) if INTERVAL_COL in df.columns else []
-
-        group_keys_display = [INTERVAL_COL]
-        if selected_treatment == "전체":
-            group_keys_display.append(TREAT_COL)
-        if PROGRESS_COL in data_use.columns:
-            group_keys_display.append(PROGRESS_COL)
-        if CHAMBER_COL in data_use.columns and facet_by_chamber:
-            group_keys_display.append(CHAMBER_COL)
-        if LINE_COL in data_use.columns and facet_by_line:
-            group_keys_display.append(LINE_COL)
-
-        n_rep = data_use[REP_COL].nunique() if REP_COL and REP_COL in data_use.columns else 0
-
-        if SUBREP_COL and SUBREP_COL in data_use.columns:
-            per_subrep_ts = (
-                data_use.groupby(group_keys_display + (([REP_COL] if REP_COL else []) + [SUBREP_COL]))[selected_voc_internal]
-                .mean()
-                .reset_index()
-            )
-        else:
-            per_subrep_ts = data_use.copy()
-
-        if n_rep and n_rep >= 2:
-            per_rep_ts = per_subrep_ts.groupby(group_keys_display + [REP_COL])[selected_voc_internal].mean().reset_index()
-            final = per_rep_ts.groupby(group_keys_display)[selected_voc_internal].agg(mean="mean", sd="std", n="count").reset_index().sort_values(INTERVAL_COL)
-            err_basis = "반복 SD/SEM"
-        else:
-            final = per_subrep_ts.groupby(group_keys_display)[selected_voc_internal].agg(mean="mean", sd="std", n="count").reset_index().sort_values(INTERVAL_COL)
-            err_basis = "소반복 SD/SEM"
-
-        final = attach_error_col(final, err_mode)
-
-        fig_kwargs = dict(
-            x=INTERVAL_COL,
-            y="mean",
-            error_y="err",
-            markers=True,
-            labels={INTERVAL_COL: "Interval (h)", "mean": f"{selected_voc} 평균농도 (ppb)"},
-            title=f"{title_prefix} - {selected_voc} 변화 추이 (평균±{err_mode}, 기준: {err_basis})",
-        )
-        if selected_treatment == "전체":
-            fig_kwargs["color"] = TREAT_COL
-        elif PROGRESS_COL in data_use.columns:
-            fig_kwargs["color"] = PROGRESS_COL
-        fig_kwargs = add_facets(fig_kwargs, final)
-        fig_voc = px.line(final, **fig_kwargs)
-        if tick_vals:
-            fig_voc.update_xaxes(tickmode='array', tickvals=tick_vals)
-        fig_voc.update_layout(margin=dict(l=10, r=10, t=60, b=10))
-        st.plotly_chart(fig_voc, use_container_width=True)
-
-        if show_subrep_lines and SUBREP_COL and SUBREP_COL in data_use.columns:
-            disp_df = per_subrep_ts.rename(columns={selected_voc_internal: "val"})
-            fig_kwargs_sub = dict(
-                x=INTERVAL_COL,
-                y="val",
-                hover_data=[SUBREP_COL] + ([REP_COL] if REP_COL else []),
-                opacity=0.35,
-            )
             if selected_treatment == "전체":
-                fig_kwargs_sub["color"] = TREAT_COL
-            elif PROGRESS_COL in data_use.columns:
-                fig_kwargs_sub["color"] = PROGRESS_COL
-            fig_kwargs_sub = add_facets(fig_kwargs_sub, disp_df)
-            fig_sub = px.line(disp_df, **fig_kwargs_sub)
-            fig_sub.update_traces(line=dict(width=1))
-            st.plotly_chart(fig_sub, use_container_width=True)
+                data_use = filtered_df.copy()
+                title_prefix = "모든 처리"
+            else:
+                data_use = filtered_df[filtered_df[TREAT_COL].astype(str) == str(selected_treatment)].copy()
+                title_prefix = f"{selected_treatment} 처리"
 
-        # Env variables if exist
-        for env_col in [TEMP_COL, HUMID_COL]:
-            if env_col not in data_use.columns:
-                continue
+            tick_vals = sorted(voc_df[INTERVAL_COL].dropna().unique().tolist()) if INTERVAL_COL in voc_df.columns else []
+            group_keys_display = [INTERVAL_COL]
+            if selected_treatment == "전체": group_keys_display.append(TREAT_COL)
+            if PROGRESS_COL in data_use.columns: group_keys_display.append(PROGRESS_COL)
+            if CHAMBER_COL in data_use.columns and facet_by_chamber: group_keys_display.append(CHAMBER_COL)
+            if LINE_COL in data_use.columns and facet_by_line: group_keys_display.append(LINE_COL)
+
+            n_rep = data_use[REP_COL].nunique() if REP_COL and REP_COL in data_use.columns else 0
             if SUBREP_COL and SUBREP_COL in data_use.columns:
-                per_subrep_env = (
-                    data_use.groupby(group_keys_display + (([REP_COL] if REP_COL else []) + [SUBREP_COL]))[env_col]
-                    .mean()
-                    .reset_index()
-                )
+                per_subrep_ts = data_use.groupby(group_keys_display + (([REP_COL] if REP_COL else []) + [SUBREP_COL]))[selected_voc_internal].mean().reset_index()
             else:
-                per_subrep_env = data_use.copy()
-
+                per_subrep_ts = data_use.copy()
             if n_rep and n_rep >= 2:
-                per_rep_env = per_subrep_env.groupby(group_keys_display + ([REP_COL] if REP_COL else []))[env_col].mean().reset_index()
-                ts_env = per_rep_env.groupby(group_keys_display)[env_col].agg(mean="mean", sd="std", n="count").reset_index().sort_values(INTERVAL_COL)
-                err_basis_env = "반복 SD/SEM"
+                per_rep_ts = per_subrep_ts.groupby(group_keys_display + [REP_COL])[selected_voc_internal].mean().reset_index()
+                final = per_rep_ts.groupby(group_keys_display)[selected_voc_internal].agg(mean="mean", sd="std", n="count").reset_index().sort_values(INTERVAL_COL)
+                err_basis = "반복 SD/SEM"
             else:
-                ts_env = per_subrep_env.groupby(group_keys_display)[env_col].agg(mean="mean", sd="std", n="count").reset_index().sort_values(INTERVAL_COL)
-                err_basis_env = "소반복 SD/SEM"
+                final = per_subrep_ts.groupby(group_keys_display)[selected_voc_internal].agg(mean="mean", sd="std", n="count").reset_index().sort_values(INTERVAL_COL)
+                err_basis = "소반복 SD/SEM"
+            final["err"] = final.apply(lambda r: sem_from_sd(r["sd"], r["n"]) if err_mode=="SEM" else r["sd"], axis=1)
 
-            ts_env = attach_error_col(ts_env, err_mode)
+            fig_kwargs = dict(x=INTERVAL_COL, y="mean", error_y="err", labels={INTERVAL_COL: "Interval (h)", "mean": f"{selected_voc} 평균농도 (ppb)"}, title=f"{title_prefix} - {selected_voc} 변화 추이 (평균±{err_mode}, 기준: {err_basis})")
+            if selected_treatment == "전체": fig_kwargs["color"] = TREAT_COL
+            elif PROGRESS_COL in data_use.columns: fig_kwargs["color"] = PROGRESS_COL
+            fig_kwargs = add_facets(fig_kwargs, final, facet_by_chamber, facet_by_line)
+            safe_line(final, **fig_kwargs)
 
-            ylab = "온도 (°C)" if env_col == TEMP_COL else "상대습도 (%)" if env_col == HUMID_COL else env_col
-            fig_kwargs_env = dict(
-                x=INTERVAL_COL,
-                y="mean",
-                error_y="err",
-                markers=True,
-                labels={INTERVAL_COL: "Interval (h)", "mean": ylab},
-                title=f"{title_prefix} - {env_col} 변화 추이 (평균±{err_mode}, 기준: {err_basis_env})",
-            )
-            if selected_treatment == "전체":
-                fig_kwargs_env["color"] = TREAT_COL
-            elif PROGRESS_COL in data_use.columns:
-                fig_kwargs_env["color"] = PROGRESS_COL
+            # 환경 보조 시리즈
+            for env_col in [TEMP_COL, HUMID_COL]:
+                if env_col not in data_use.columns: continue
+                if SUBREP_COL and SUBREP_COL in data_use.columns:
+                    per_subrep_env = data_use.groupby(group_keys_display + (([REP_COL] if REP_COL else []) + [SUBREP_COL]))[env_col].mean().reset_index()
+                else:
+                    per_subrep_env = data_use.copy()
+                if n_rep and n_rep >= 2:
+                    per_rep_env = per_subrep_env.groupby(group_keys_display + ([REP_COL] if REP_COL else []))[env_col].mean().reset_index()
+                    ts_env = per_rep_env.groupby(group_keys_display)[env_col].agg(mean="mean", sd="std", n="count").reset_index().sort_values(INTERVAL_COL)
+                    err_basis_env = "반복 SD/SEM"
+                else:
+                    ts_env = per_subrep_env.groupby(group_keys_display)[env_col].agg(mean="mean", sd="std", n="count").reset_index().sort_values(INTERVAL_COL)
+                    err_basis_env = "소반복 SD/SEM"
+                ts_env["err"] = ts_env.apply(lambda r: sem_from_sd(r["sd"], r["n"]) if err_mode=="SEM" else r["sd"], axis=1)
+                ylab = "온도 (°C)" if env_col == TEMP_COL else "상대습도 (%)" if env_col == HUMID_COL else env_col
+                fig_kwargs_env = dict(x=INTERVAL_COL, y="mean", error_y="err", labels={INTERVAL_COL: "Interval (h)", "mean": ylab}, title=f"{title_prefix} - {env_col} 변화 추이 (평균±{err_mode}, 기준: {err_basis_env})")
+                if selected_treatment == "전체": fig_kwargs_env["color"] = TREAT_COL
+                elif PROGRESS_COL in data_use.columns: fig_kwargs_env["color"] = PROGRESS_COL
+                fig_kwargs_env = add_facets(fig_kwargs_env, ts_env, facet_by_chamber, facet_by_line)
+                safe_line(ts_env, **fig_kwargs_env)
 
-            fig_kwargs_env = add_facets(fig_kwargs_env, ts_env)
-            fig_env = px.line(ts_env, **fig_kwargs_env)
-            if tick_vals:
-                fig_env.update_xaxes(tickmode='array', tickvals=tick_vals)
-            fig_env.update_layout(margin=dict(l=10, r=10, t=60, b=10))
-            st.plotly_chart(fig_env, use_container_width=True)
+        else:  # 전체 VOC 스크리닝
+            selected_interval = st.sidebar.selectbox("⏱ Interval (h) 선택", ["전체"] + intervals_all if 'intervals_all' in locals() else ["전체"], key="scr_interval")
+            alpha = st.sidebar.number_input("유의수준 α", min_value=0.001, max_value=0.20, value=0.05, step=0.001, format="%.3f", key="scr_alpha")
+            include_rep_block_scr = st.sidebar.checkbox("반복을 블록요인으로 포함(스크리닝)", value=bool(REP_COL)) if REP_COL else False
 
-# ----- 전체 VOC 스크리닝 -----
-else:
-    st.subheader("🔎 전체 VOC 스크리닝 (ANOVA 일괄 분석)")
-
-    selected_interval = st.sidebar.selectbox("⏱ Interval (h) 선택", ["전체"] + intervals_all, key="scr_interval")
-    alpha = st.sidebar.number_input("유의수준 α", min_value=0.001, max_value=0.20, value=0.05, step=0.001, format="%.3f", key="scr_alpha")
-    do_posthoc = st.sidebar.checkbox("사후검정(Tukey/Duncan) 요약 포함", value=True)
-    posthoc_method = st.sidebar.selectbox("사후검정 방법", ["Tukey HSD", "Duncan"], index=0)
-    only_sig = st.sidebar.checkbox("유의 VOC만 표시 (p < α)", value=False)
-    show_letters_cols = st.sidebar.checkbox("Letters 요약 문자열 포함", value=True)
-    include_rep_block_scr = st.sidebar.checkbox("반복을 블록요인으로 포함(스크리닝)", value=bool(REP_COL)) if REP_COL else False
-
-    if selected_interval == "전체":
-        data_use = filtered_df.copy()
-        title_suffix = "모든 시간"
-    else:
-        data_use = filtered_df[filtered_df[INTERVAL_COL] == selected_interval].copy()
-        title_suffix = f"Interval: {selected_interval}h"
-
-    sm, smf, MultiComparison, sp, HAS_SCPH = _lazy_import_stats()
-
-    results = []
-    for voc in voc_columns:
-        base_cols = [TREAT_COL, voc]
-        if REP_COL: base_cols.append(REP_COL)
-        if SUBREP_COL: base_cols.append(SUBREP_COL)
-        sub = data_use[base_cols].dropna().copy()
-        if sub.empty or sub[TREAT_COL].nunique() < 2:
-            continue
-        if not all(sub.groupby(TREAT_COL)[voc].count() >= 2):
-            continue
-        a_df = sub.rename(columns={voc: "y", TREAT_COL: "treat"})
-        try:
-            if include_rep_block_scr and REP_COL and REP_COL in a_df.columns:
-                a_df["rep"] = a_df[REP_COL].astype(str)
-                model = smf.ols("y ~ C(treat) + C(rep)", data=a_df).fit()
+            if selected_interval == "전체":
+                data_use = filtered_df.copy()
+                title_suffix = "모든 시간"
             else:
-                model = smf.ols("y ~ C(treat)", data=a_df).fit()
-            anova_table = sm.stats.anova_lm(model, typ=2)
-            pval = float(anova_table.loc["C(treat)", "PR(>F)"])
-            stars = p_to_stars(pval)
-        except Exception:
-            pval, stars = np.nan, "ERR"
+                data_use = filtered_df[filtered_df[INTERVAL_COL] == selected_interval].copy()
+                title_suffix = f"Interval: {selected_interval}h"
 
-        letters_str = ""
-        if do_posthoc and np.isfinite(pval) and MultiComparison:
-            treat_order = sorted(a_df["treat"].astype(str).unique().tolist())
-            if posthoc_method == "Tukey HSD":
-                mc = MultiComparison(a_df["y"], a_df["treat"])
-                tukey = mc.tukeyhsd(alpha=alpha)
-                tukey_df = pd.DataFrame(tukey._results_table.data[1:], columns=tukey._results_table.data[0])
-                ns_pairs = set()
-                for _, row in tukey_df.iterrows():
-                    g1, g2, reject = str(row["group1"]), str(row["group2"]), bool(row["reject"])
-                    if not reject:
-                        ns_pairs.add(tuple(sorted((g1, g2))))
-                for g in treat_order:
-                    ns_pairs.add((g, g))
-                letters = cld_from_nonsig(treat_order, ns_pairs)
-                if show_letters_cols:
-                    letters_str = "; ".join([f"{t}={letters.get(str(t), '')}" for t in treat_order])
-            elif posthoc_method == "Duncan" and sp is not None:
+            import importlib
+            sm = importlib.import_module("statsmodels.api")
+            smf = importlib.import_module("statsmodels.formula.api")
+
+            results = []
+            for voc in voc_columns:
+                base_cols = [TREAT_COL, voc]
+                if REP_COL: base_cols.append(REP_COL)
+                if SUBREP_COL: base_cols.append(SUBREP_COL)
+                sub = data_use[base_cols].dropna().copy()
+                if sub.empty or sub[TREAT_COL].nunique() < 2: continue
+                if not all(sub.groupby(TREAT_COL)[voc].count() >= 2): continue
+                a_df = sub.rename(columns={voc: "y", TREAT_COL: "treat"})
                 try:
-                    duncan_mat = sp.posthoc_duncan(a_df, val_col="y", group_col="treat", alpha=alpha)
-                    ns_pairs = set()
-                    for g1 in duncan_mat.index.astype(str):
-                        for g2 in duncan_mat.columns.astype(str):
-                            if g1 == g2:
-                                ns_pairs.add(tuple(sorted((g1, g2))))
-                            else:
-                                p = duncan_mat.loc[g1, g2]
-                                if pd.isna(p) or p >= alpha:
-                                    ns_pairs.add(tuple(sorted((g1, g2))))
-                    letters = cld_from_nonsig(treat_order, ns_pairs)
-                    if show_letters_cols:
-                        letters_str = "; ".join([f"{t}={letters.get(str(t), '')}" for t in treat_order])
-                except Exception as e:
-                    letters_str = f"Duncan err: {e}"
+                    if include_rep_block_scr and REP_COL and REP_COL in a_df.columns:
+                        a_df["rep"] = a_df[REP_COL].astype(str)
+                        model = smf.ols("y ~ C(treat) + C(rep)", data=a_df).fit()
+                    else:
+                        model = smf.ols("y ~ C(treat)", data=a_df).fit()
+                    anova_table = sm.stats.anova_lm(model, typ=2)
+                    pval = float(anova_table.loc["C(treat)", "PR(>F)"])
+                except Exception:
+                    pval = np.nan
+                results.append({"VOC": display_name(voc), "p_value": pval})
 
-        results.append({
-            "VOC": display_name(voc),
-            "p_value": pval,
-            "Significance": stars,
-            "Letters": letters_str,
-        })
+            if not results:
+                st.info("조건에 맞는 데이터가 없어 스크리닝 결과가 비어있습니다.")
+            else:
+                res_df = pd.DataFrame(results).sort_values("p_value", na_position="last")
+                st.markdown(f"**Interval: {title_suffix}**, α={alpha}")
+                st.dataframe(res_df, use_container_width=True)
+                st.download_button(
+                    "⬇️ 스크리닝 결과 CSV",
+                    data=res_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="voc_screening_results.csv",
+                    mime="text/csv",
+                )
 
-    if not results:
-        st.info("조건에 맞는 데이터가 없어 스크리닝 결과가 비어있습니다. 필터/Interval/Progress를 확인하세요.")
+# ============================
+# 4) 환경 데이터 분석 (Tomato/Larva 개별 + Rep 지원)
+# ============================
+if mode == "환경 데이터 분석":
+    st.subheader("🌱 환경 데이터 분석 (Tomato / Larva 개별)")
+
+    st.sidebar.header("📁 환경 데이터 업로드")
+    tomato_file = st.sidebar.file_uploader("토마토 환경 (xlsx/xls/csv)", type=["xlsx","xls","csv"], key="env_tomato")
+    larva_file  = st.sidebar.file_uploader("애벌레 환경 (xlsx/xls/csv)", type=["xlsx","xls","csv"], key="env_larva")
+
+    @st.cache_data(show_spinner=False)
+    def read_env(file):
+        if file is None:
+            return None
+        name = file.name.lower()
+        b = file.getvalue()
+        if name.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(b))
+        else:
+            xlf = pd.ExcelFile(io.BytesIO(b))
+            df = xlf.parse(xlf.sheet_names[0])
+        return df
+
+    df_t = read_env(tomato_file)
+    df_l = read_env(larva_file)
+
+    # 자동 매핑
+    ENV_CANON = {
+        "Date": ["date","날짜"],
+        "Time": ["time","시간"],
+        "Timestamp": ["timestamp","datatime","datetime","일시","측정시각"],
+        "Temperature (℃)": ["temperature (℃)","temperature","temp","온도"],
+        "Relative humidity (%)": ["relative humidity (%)","humidity","humid","rh","습도"],
+        "PAR Light (μmol·m2·s-1)": ["par light (μmol·m2·s-1)","par","ppfd","광도","light","light (μmol m-2 s-1)","light (μmol·m2·s-1)","light (μmol m−2 s−1)"],
+        "Repetition": ["repetition","replicate","rep","반복","반복수"],
+    }
+    def normalize(s):
+        return str(s).strip().lower().replace("_"," ").replace("-"," ").replace("−","-")
+    def env_standardize_columns(df):
+        if df is None: return None
+        col_map = {}
+        for c in df.columns:
+            lc = normalize(c)
+            mapped = None
+            for canon, aliases in ENV_CANON.items():
+                if lc == normalize(canon) or lc in [normalize(a) for a in aliases]:
+                    mapped = canon; break
+            if mapped: col_map[c] = mapped
+        if col_map: df = df.rename(columns=col_map)
+        return df
+    def coerce_ts(df):
+        if df is None: return None
+        if "Timestamp" in df.columns:
+            ts = pd.to_datetime(df["Timestamp"], errors="coerce")
+        elif "Date" in df.columns and "Time" in df.columns:
+            ts = pd.to_datetime(df["Date"].astype(str) + " " + df["Time"].astype(str), errors="coerce")
+        elif "Date" in df.columns:
+            ts = pd.to_datetime(df["Date"], errors="coerce")
+        else:
+            ts = pd.Series(pd.NaT, index=df.index)
+        df = df.assign(__ts__=ts)
+        df = df.dropna(subset=["__ts__"]).sort_values("__ts__")
+        for col in ["Temperature (℃)", "Relative humidity (%)", "PAR Light (μmol·m2·s-1)"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+
+    df_t = coerce_ts(env_standardize_columns(df_t))
+    df_l = coerce_ts(env_standardize_columns(df_l))
+
+    available_datasets = []
+    if df_t is not None and not df_t.empty: available_datasets.append("Tomato")
+    if df_l is not None and not df_l.empty: available_datasets.append("Larva")
+    if not available_datasets:
+        st.info("좌측에서 **토마토** 또는 **애벌레** 환경 파일을 업로드하세요.")
+        st.stop()
+    dataset = st.radio("분석할 데이터셋 선택", options=available_datasets, horizontal=True)
+    df_env = df_t if dataset=="Tomato" else df_l
+
+    has_rep = "Repetition" in (df_env.columns if df_env is not None else [])
+    rep_values = sorted(df_env["Repetition"].dropna().astype(str).unique().tolist()) if has_rep else []
+    rep_choice = st.selectbox("🔁 Repetition 선택", ["전체(통합)"] + rep_values if has_rep else ["(반복 없음)"], index=0, disabled=not has_rep)
+    use_overlap_reps = st.checkbox("반복 간 '겹치는 기간'만 사용(통합일 때)", value=True, disabled=(not has_rep or rep_choice!="전체(통합)"),
+                                   help="반복마다 기록 기간이 다르면 교집합 시간만으로 평균/표준편차 계산")
+
+    RES_RULE = "60min"
+    exclude_zero_for_mean = st.checkbox("광 평균/표준편차 계산 시 0(불꺼짐) 제외", value=True)
+
+    def hourly_metrics(df):
+        idx = df.set_index("__ts__").sort_index()
+        base = idx.resample(RES_RULE).asfreq().index
+        out = {}
+        if "Temperature (℃)" in idx.columns:
+            out["temp_mean"] = idx["Temperature (℃)"].resample(RES_RULE).mean()
+            out["temp_sd"]   = idx["Temperature (℃)"].resample(RES_RULE).std()
+        if "Relative humidity (%)" in idx.columns:
+            out["hum_mean"] = idx["Relative humidity (%)"].resample(RES_RULE).mean()
+            out["hum_sd"]   = idx["Relative humidity (%)"].resample(RES_RULE).std()
+        if "PAR Light (μmol·m2·s-1)" in idx.columns:
+            par = idx["PAR Light (μmol·m2·s-1)"]
+            par_hour_all = par.resample(RES_RULE).mean()  # 0 포함 평균
+            duty = par.resample(RES_RULE).apply(lambda g: float((g>0).mean()) if len(g)>0 else np.nan)
+            def mean_on(g):
+                g2 = g[g>0] if exclude_zero_for_mean else g
+                return float(g2.mean()) if len(g2)>0 else np.nan
+            def sd_on(g):
+                g2 = g[g>0] if exclude_zero_for_mean else g
+                return float(g2.std()) if len(g2)>1 else (0.0 if len(g2)==1 else np.nan)
+            par_mean_on = par.resample(RES_RULE).apply(mean_on)
+            par_sd_on   = par.resample(RES_RULE).apply(sd_on)
+            hli = (par_hour_all * 3600.0) / 1_000_000.0
+            out["par_mean_on"] = par_mean_on
+            out["par_sd_on"]   = par_sd_on
+            out["par_duty"]    = duty
+            out["hli"]         = hli
+        dfh = pd.DataFrame(index=base)
+        for k,v in out.items():
+            dfh[k] = v.reindex(base)
+        return dfh.reset_index().rename(columns={"index":"Time"})
+
+    def hourly_by_rep(df_env):
+        if not has_rep:
+            out = {"__ALL__": hourly_metrics(df_env)}
+            return {k:v for k,v in out.items() if isinstance(v, pd.DataFrame) and "Time" in v.columns}
+        rep_map = {}
+        for r in sorted(df_env["Repetition"].dropna().unique()):
+            sub = df_env[df_env["Repetition"]==r]
+            if sub.empty: 
+                continue
+            hm = hourly_metrics(sub)
+            if isinstance(hm, pd.DataFrame) and "Time" in hm.columns:
+                rep_map[str(r)] = hm
+        return rep_map
+
+    rep_series = hourly_by_rep(df_env)
+
+    def merge_times(rep_map, key):
+        if not isinstance(rep_map, dict) or not rep_map:
+            return pd.DataFrame(columns=["Time","mean","sd","n"])
+        # take only dataframes that have both Time and the key
+        dfs = [d for d in rep_map.values() if isinstance(d, pd.DataFrame) and ("Time" in d.columns) and (key in d.columns)]
+        if not dfs:
+            return pd.DataFrame(columns=["Time","mean","sd","n"])
+        # build base times
+        time_sets = [set(pd.to_datetime(d["Time"], errors="coerce").dropna()) for d in dfs]
+        if not time_sets:
+            return pd.DataFrame(columns=["Time","mean","sd","n"])
+        base_times = sorted(set.intersection(*time_sets)) if use_overlap_reps else sorted(set.union(*time_sets))
+        rows = []
+        for ts in base_times:
+            vals = []
+            for d in dfs:
+                v = d.loc[pd.to_datetime(d["Time"], errors="coerce")==ts, key]
+                if len(v)==1 and pd.notna(v.values[0]):
+                    vals.append(float(v.values[0]))
+            if vals:
+                rows.append({"Time": ts, "mean": float(np.mean(vals)), "sd": float(np.std(vals, ddof=1)) if len(vals)>1 else 0.0, "n": len(vals)})
+        return pd.DataFrame(rows)
+
+    def available_metrics_for(df_or_map):
+        keys = set()
+        if isinstance(df_or_map, dict):
+            for _, d in df_or_map.items():
+                if isinstance(d, pd.DataFrame):
+                    keys.update([c for c in d.columns if c != "Time"])
+        elif isinstance(df_or_map, pd.DataFrame):
+            keys.update([c for c in df_or_map.columns if c != "Time"])
+        order = ["temp_mean","hum_mean","par_mean_on","par_duty","hli"]
+        return [k for k in order if k in keys]
+
+    pretty = {
+        "temp_mean": "Temperature (℃)",
+        "hum_mean": "Relative humidity (%)",
+        "par_mean_on": "PAR (Light-on mean, μmol·m⁻²·s⁻¹)",
+        "par_duty": "Photoperiod duty (0~1)",
+        "hli": "Hourly light integral (mol·m⁻²·h⁻¹)",
+    }
+
+    st.markdown("### 📐 지표 선택")
+    if rep_choice == "전체(통합)":
+        avail = available_metrics_for(rep_series)
     else:
-        res_df = pd.DataFrame(results).sort_values("p_value", na_position="last")
-        if only_sig:
-            res_df = res_df[res_df["p_value"] < alpha]
-        st.markdown(f"**Interval: {title_suffix}**, α={alpha}")
-        st.dataframe(res_df, use_container_width=True)
-        st.download_button(
-            "⬇️ 스크리닝 결과 CSV",
-            data=res_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="voc_screening_results.csv",
-            mime="text/csv",
-        )
+        dfh_sel = rep_series.get(rep_choice) if has_rep else rep_series.get("__ALL__")
+        avail = available_metrics_for(dfh_sel) if isinstance(dfh_sel, pd.DataFrame) else []
+    if not avail:
+        st.info("사용 가능한 지표가 없습니다. 데이터 컬럼을 확인하세요.")
+        st.stop()
 
-# ---------- 원본 데이터 확인 ----------
-with st.expander("🔍 원본 데이터 보기"):
-    st.dataframe(df, use_container_width=True)
+    options_pretty = [pretty.get(k,k) for k in avail]
+    metrics = st.multiselect("표시할 지표", options=options_pretty, default=options_pretty)
+    inv = {pretty.get(k,k): k for k in avail}
+    metrics_keys = [inv[m] for m in metrics if m in inv]
+
+    st.markdown("### 📊 표시 유형")
+    view_type = st.radio("그래프 유형", ["시계열", "막대그래프"], index=0, horizontal=True)
+
+    # ---- 시계열 ----
+    if view_type == "시계열":
+        if rep_choice == "전체(통합)":
+            err_mode_env = st.radio("오차 막대", ["SD","SEM"], index=0, key="env_err_all")
+            for key in metrics_keys:
+                agg = merge_times(rep_series, key).sort_values("Time")
+                if agg.empty:
+                    st.info(f"{pretty.get(key,key)}: 데이터 없음"); continue
+                agg["err"] = agg.apply(lambda r: sem_from_sd(r["sd"], r["n"]) if err_mode_env=="SEM" else r["sd"], axis=1)
+                safe_line(agg, x="Time", y="mean", error_y="err", labels={"mean":pretty.get(key,key)}, title=f"{pretty.get(key,key)} — 반복 통합(시간당 평균±{err_mode_env})")
+        else:
+            dfh = rep_series.get(rep_choice) if has_rep else rep_series.get("__ALL__")
+            if not isinstance(dfh, pd.DataFrame) or dfh.empty:
+                st.info("선택한 반복에서 데이터가 없습니다.")
+            else:
+                for key in metrics_keys:
+                    if key not in dfh.columns:
+                        st.info(f"{pretty.get(key,key)}: 데이터 없음"); continue
+                    safe_line(dfh, x="Time", y=key, labels={key:pretty.get(key,key)}, title=f"{pretty.get(key,key)} — Repetition {rep_choice}")
+
+    # ---- 막대그래프 ----
+    else:
+        agg_basis = st.selectbox("집계 기준", ["시간당 값의 평균±SD", "일단위 합계/평균±SD"], key="env_bar_basis")
+        def summarize_hours(dfh, key):
+            d = dfh.dropna(subset=[key]) if isinstance(dfh, pd.DataFrame) else pd.DataFrame()
+            if d is None or d.empty: return {"mean":np.nan,"sd":np.nan,"n":0}
+            vals = pd.to_numeric(d[key], errors='coerce').dropna()
+            if vals.empty: return {"mean":np.nan,"sd":np.nan,"n":0}
+            return {"mean":float(vals.mean()), "sd":float(vals.std(ddof=1) if len(vals)>1 else 0.0), "n":int(len(vals))}
+        def summarize_daily(dfh, key):
+            if not isinstance(dfh, pd.DataFrame) or dfh.empty: return {"mean":np.nan,"sd":np.nan,"n":0}
+            d = dfh.copy()
+            d["date"] = pd.to_datetime(d["Time"], errors="coerce").dt.date
+            d = d.dropna(subset=["date"])
+            if key == "hli":
+                grp = d.groupby("date")["hli"].sum().rename("val")
+            else:
+                grp = d.groupby("date")[key].mean().rename("val")
+            vals = pd.to_numeric(grp, errors='coerce').dropna()
+            if vals.empty: return {"mean":np.nan,"sd":np.nan,"n":0}
+            return {"mean":float(vals.mean()), "sd":float(vals.std(ddof=1) if len(vals)>1 else 0.0), "n":int(len(vals))}
+
+        if rep_choice == "전체(통합)":
+            bar_mode = st.radio("막대 유형", ["반복별 막대", "반복 통합(하나의 막대)"], index=0, horizontal=True, key="env_bar_mode")
+            for key in metrics_keys:
+                rows = []
+                for r, dfh in rep_series.items():
+                    if r == "__ALL__": continue
+                    if not isinstance(dfh, pd.DataFrame) or key not in dfh.columns: continue
+                    stat = summarize_hours(dfh, key) if agg_basis=="시간당 값의 평균±SD" else summarize_daily(dfh, key)
+                    rows.append({"Repetition": str(r), "mean":stat["mean"], "sd":stat["sd"], "n":stat["n"]})
+                if not rows:
+                    st.info(f"{pretty.get(key,key)}: 요약할 데이터 없음"); continue
+                bar_df = pd.DataFrame(rows)
+                if bar_mode == "반복 통합(하나의 막대)":
+                    pooled = {"Repetition":"ALL", "mean":bar_df["mean"].mean(), "sd":bar_df["mean"].std(ddof=1) if len(bar_df)>1 else 0.0, "n":len(bar_df)}
+                    bar_df = pd.DataFrame([pooled])
+                err_mode2 = st.radio(f"{pretty.get(key,key)} — 오차", ["SD","SEM"], index=0, key=f"env_bar_err_{key}")
+                bar_df["err"] = bar_df.apply(lambda r: (r["sd"]/np.sqrt(r["n"])) if (err_mode2=="SEM" and r["n"]>0) else r["sd"], axis=1)
+                safe_bar(bar_df, x="Repetition", y="mean", error_y="err", labels={"mean":pretty.get(key,key)}, title=f"{pretty.get(key,key)} — {agg_basis}")
+        else:
+            dfh = rep_series.get(rep_choice) if has_rep else rep_series.get("__ALL__")
+            for key in metrics_keys:
+                if not isinstance(dfh, pd.DataFrame) or key not in dfh.columns:
+                    st.info(f"{pretty.get(key,key)}: 데이터 없음"); continue
+                stat = summarize_hours(dfh, key) if agg_basis=="시간당 값의 평균±SD" else summarize_daily(dfh, key)
+                bar_df = pd.DataFrame([{"Repetition": str(rep_choice), "mean":stat["mean"], "sd":stat["sd"], "n":stat["n"]}])
+                err_mode2 = st.radio(f"{pretty.get(key,key)} — 오차", ["SD","SEM"], index=0, key=f"env_bar_err_single_{key}")
+                bar_df["err"] = bar_df.apply(lambda r: (r["sd"]/np.sqrt(r["n"])) if (err_mode2=="SEM" and r["n"]>0) else r["sd"], axis=1)
+                safe_bar(bar_df, x="Repetition", y="mean", error_y="err", labels={"mean":pretty.get(key,key)}, title=f"{pretty.get(key,key)} — {agg_basis}")
+
+# ---------- 원본 데이터 보기 ----------
+with st.expander("🔍 VOC 원본 데이터 보기"):
+    if voc_df is not None:
+        st.dataframe(voc_df, use_container_width=True)
+    else:
+        st.caption("VOC 데이터가 업로드되지 않았습니다.")
+with st.expander("🔍 환경 원본 데이터 컬럼 도움말"):
+    st.markdown("""
+필수/선택 컬럼 (자동 매핑 지원)
+- **Timestamp** _또는_ (**Date** + **Time**)
+- **Temperature (℃)**, **Relative humidity (%)**
+- **PAR Light (μmol·m2·s-1)** (선택, 광 분석 시 필요)
+- **Repetition** (선택, 반복 분석 시)
+""")
